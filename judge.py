@@ -44,14 +44,9 @@ async def judge_equivalence(
         ground_truth=ground_truth,
         candidate=candidate,
     )
-    response = await client.responses.create(
+    response = await client.chat.completions.create(
         model=model,
-        input=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": prompt}],
     )
-    response_text = ""
-    for item in response.output:
-        if hasattr(item, "text") and item.text:
-            response_text += item.text
-        elif hasattr(item, "content"):
-            response_text += str(item.content)
+    response_text = response.choices[0].message.content or ""
     return _parse_judgment(response_text)
