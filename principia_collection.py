@@ -91,7 +91,7 @@ class PrincipiaCollection(Environment):
                     "OpenAI API key required in secrets for LLM judging. "
                     "Pass via secrets={'openai_api_key': 'your-key'}"
                 )
-            self.client = openai.AsyncClient(api_key=api_key)
+            self.client = openai.AsyncClient(api_key=api_key, max_retries=6)
         else:
             self.client = None
 
