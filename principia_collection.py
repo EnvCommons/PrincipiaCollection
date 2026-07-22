@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 from math_verify import parse, verify
 from pydantic import BaseModel
 
-from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, tool
+from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
 
 from judge import judge_equivalence
 
@@ -199,9 +199,18 @@ class PrincipiaCollection(Environment):
     def get_prompt(self) -> list[TextBlock]:
         return [TextBlock(type="text", text=self.problem)]
 
+    @terminal
     @tool
     async def submit(self, params: SubmitParams) -> ToolOutput:
-        """Submit your answer for grading. This will end the episode."""
+        """Grade the assistant's final message against the ground truth.
+
+        Terminal tool: hidden from the model, which replies with its answer as
+        an ordinary message rather than calling a tool. The harness routes that
+        message text here. Numerical answers are checked with math-verify
+        (parses LaTeX, \boxed{...}, and other common formats out of prose);
+        non-numerical answers go to an LLM equivalence judge. Since this is
+        the environment's only tool, the model is given no tools at all.
+        """
         if self.is_numerical:
             is_correct = _verify_math_answer(self.ground_truth, params.answer)
         else:

@@ -36,7 +36,12 @@ Source: [facebook/principia-collection](https://huggingface.co/datasets/facebook
 
 ## Tools
 
-- `submit(answer: str)` — Submit an answer for grading. Ends the episode.
+None. The model is given no tools: it answers the problem as an ordinary
+message, and that message ends the rollout.
+
+Grading runs through a hidden `@terminal` tool: numerical answers are checked
+with math-verify (LaTeX-aware, tolerant of \\boxed{} and other common
+formats), and non-numerical answers are judged by an LLM for equivalence.
 
 ## Time Horizon
 
