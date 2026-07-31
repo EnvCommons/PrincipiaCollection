@@ -9,6 +9,7 @@ Dataset: HuggingFace facebook/principia-collection
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import os
 from typing import Optional
@@ -110,6 +111,30 @@ def _verify_math_answer(ground_truth: str, candidate: str) -> bool:
         return False
 
 
+# math-verify runs sympy, which is CPU-bound and can hang effectively forever on
+# pathological expressions. The env-server runs on a single asyncio event loop, so
+# calling verify() inline inside the async submit tool froze the loop for *every*
+# co-tenant session on the pod — thousands of /ping timeouts -> 502 storm, pod
+# wedged with the process alive but unresponsive. Run it in a worker thread so it
+# can't block the loop, and bound it with a timeout so a runaway verification is
+# scored as incorrect instead of stalling the session.
+_VERIFY_TIMEOUT_S = 10.0
+
+
+async def _verify_math_answer_async(ground_truth: str, candidate: str) -> bool:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_verify_math_answer, ground_truth, candidate),
+            timeout=_VERIFY_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # Runaway sympy: the worker thread may keep running (threads can't be
+        # cancelled), but the loop and this session are freed. Treat as incorrect.
+        return False
+    except Exception:
+        return False
+
+
 class SubmitParams(BaseModel, extra="forbid"):
     answer: str
 
@@ -157,12 +182,19 @@ class PrincipiaCollection(Environment):
         path = _SPLIT_FILES.get(split)
         if path is None:
             return 0
-        return pq.ParquetFile(path).metadata.num_rows
+        # Reading the parquet footer is blocking I/O; keep it off the event loop.
+        return await asyncio.to_thread(lambda: pq.ParquetFile(path).metadata.num_rows)
 
     @classmethod
     async def get_task(cls, split: str, index: int) -> JSONObject:
         """Single task spec served from the cached Arrow table (no full list)."""
-        row = _split_table(split).slice(index, 1).to_pylist()[0]
+        # _split_table() materializes the full (554K-row) table on first touch —
+        # a multi-second, blocking read. get_task runs on the create hot path, so
+        # offload it to a worker thread to avoid stalling the loop for other
+        # sessions on the pod.
+        row = await asyncio.to_thread(
+            lambda: _split_table(split).slice(index, 1).to_pylist()[0]
+        )
         return _public_task_spec(split, index, row)
 
     @classmethod
@@ -172,20 +204,23 @@ class PrincipiaCollection(Environment):
         """Range of task specs from the cached Arrow table (slice, then convert)."""
         if split not in _SPLIT_FILES:
             return []
-        table = _split_table(split)
-        total = table.num_rows
-        if start is None:
-            start = 0
-        if stop is None:
-            stop = total
-        if start < 0:
-            start = max(total + start, 0)
-        if stop < 0:
-            stop = max(total + stop, 0)
-        start = min(start, total)
-        stop = min(stop, total)
-        rows = table.slice(start, max(stop - start, 0)).to_pylist()
-        return [_public_task_spec(split, start + i, row) for i, row in enumerate(rows)]
+
+        def _materialize() -> list[JSONObject]:
+            # Full-table materialization + slice->pylist is blocking; run off-loop.
+            table = _split_table(split)
+            total = table.num_rows
+            lo = 0 if start is None else start
+            hi = total if stop is None else stop
+            if lo < 0:
+                lo = max(total + lo, 0)
+            if hi < 0:
+                hi = max(total + hi, 0)
+            lo = min(lo, total)
+            hi = min(hi, total)
+            rows = table.slice(lo, max(hi - lo, 0)).to_pylist()
+            return [_public_task_spec(split, lo + i, row) for i, row in enumerate(rows)]
+
+        return await asyncio.to_thread(_materialize)
 
     @classmethod
     def list_tasks(cls, split: str) -> list[JSONObject]:
@@ -212,7 +247,7 @@ class PrincipiaCollection(Environment):
         the environment's only tool, the model is given no tools at all.
         """
         if self.is_numerical:
-            is_correct = _verify_math_answer(self.ground_truth, params.answer)
+            is_correct = await _verify_math_answer_async(self.ground_truth, params.answer)
         else:
             is_correct = await judge_equivalence(
                 problem=self.problem,
