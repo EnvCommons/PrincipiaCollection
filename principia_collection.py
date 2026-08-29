@@ -135,6 +135,11 @@ async def _verify_math_answer_async(ground_truth: str, candidate: str) -> bool:
         return False
 
 
+# Reward for a submission made after the task has already been graded. Negative
+# so repeat submissions are actively discouraged, not merely left unscored.
+REPEAT_SUBMISSION_PENALTY = -0.1
+
+
 class SubmitParams(BaseModel, extra="forbid"):
     answer: str
 
@@ -158,6 +163,13 @@ class PrincipiaCollection(Environment):
             self.ground_truth = task_spec["answer"]
         else:
             self.ground_truth = _ground_truth_for(self.task_id)
+
+        # Graded submissions this session. @terminal already hides this tool from
+        # the model, so the harness normally invokes it once at the end of the
+        # rollout -- but Environment._call_tool dispatches by name and does not
+        # exclude terminal tools, so a direct second call would re-grade and pay
+        # out again. Defence in depth.
+        self.submitted = 0
 
         self.is_numerical = self.task_split == "train_numerical"
 
@@ -246,6 +258,16 @@ class PrincipiaCollection(Environment):
         non-numerical answers go to an LLM equivalence judge. Since this is
         the environment's only tool, the model is given no tools at all.
         """
+        if self.submitted > 0:
+            return ToolOutput(
+                blocks=[TextBlock(type="text", text="An answer has already been submitted for this task. "
+                                       "This episode is over: it is not re-graded, and repeat "
+                                       "submissions are penalised (reward -0.1).")],
+                metadata={"already_submitted": True, "submission_count": self.submitted},
+                reward=REPEAT_SUBMISSION_PENALTY,
+                finished=True,
+            )
+
         if self.is_numerical:
             is_correct = await _verify_math_answer_async(self.ground_truth, params.answer)
         else:
@@ -257,6 +279,8 @@ class PrincipiaCollection(Environment):
             )
 
         reward = 1.0 if is_correct else 0.0
+
+        self.submitted += 1
 
         return ToolOutput(
             blocks=[TextBlock(type="text", text=f"Reward: {reward}")],
