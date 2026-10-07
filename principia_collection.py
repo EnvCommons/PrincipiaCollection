@@ -10,8 +10,12 @@ Dataset: HuggingFace facebook/principia-collection
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
+import logging
+import multiprocessing
 import os
+from concurrent.futures.process import BrokenProcessPool
 from typing import Optional
 
 import openai
@@ -22,6 +26,8 @@ from pydantic import BaseModel
 from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
 
 from judge import judge_equivalence
+
+logger = logging.getLogger(__name__)
 
 # Paths only — no parquet is read at import, so workers boot without paying the
 # ~30s cost of materializing the 554K-row dataset (which timed out create_session
@@ -104,35 +110,65 @@ def _parse_answer(answer: str) -> list:
 
 
 def _verify_math_answer(ground_truth: str, candidate: str) -> bool:
-    """Check if candidate is mathematically equivalent to ground truth using math-verify."""
-    try:
-        return verify(_parse_answer(ground_truth), _parse_answer(candidate))
-    except Exception:
-        return False
+    """Check if candidate is mathematically equivalent to ground truth using math-verify.
+
+    math-verify bounds each parse and comparison with signal.alarm, which only
+    works in a process's main thread: in any other thread it raises instead of
+    grading. Call this on a main thread (e.g. in a _verify_pool() worker).
+    """
+    return verify(_parse_answer(ground_truth), _parse_answer(candidate))
 
 
-# math-verify runs sympy, which is CPU-bound and can hang effectively forever on
-# pathological expressions. The env-server runs on a single asyncio event loop, so
-# calling verify() inline inside the async submit tool froze the loop for *every*
-# co-tenant session on the pod — thousands of /ping timeouts -> 502 storm, pod
-# wedged with the process alive but unresponsive. Run it in a worker thread so it
-# can't block the loop, and bound it with a timeout so a runaway verification is
-# scored as incorrect instead of stalling the session.
-_VERIFY_TIMEOUT_S = 10.0
+# math-verify runs sympy, which is CPU-bound and can run for minutes on
+# pathological expressions (e.g. \boxed{9^{9^{9}}}). The env-server runs every
+# session on a single asyncio event loop, so verification must not run on it.
+# It runs in worker processes instead of threads: each task runs on the worker's
+# main thread, where math-verify's own per-operation timeouts (signal.alarm)
+# interrupt runaway sympy, and the loop never shares a GIL with it.
+# _VERIFY_TIMEOUT_S is an outer backstop that also covers time queued behind
+# other verifications; it is longer than math-verify's worst case for a
+# typical answer (a few parses and comparisons, at most 5 s each).
+_VERIFY_TIMEOUT_S = 60.0
+_VERIFY_WORKERS = 2
+_verify_pool_instance: Optional[concurrent.futures.ProcessPoolExecutor] = None
 
 
-async def _verify_math_answer_async(ground_truth: str, candidate: str) -> bool:
+def _verify_pool() -> concurrent.futures.ProcessPoolExecutor:
+    global _verify_pool_instance
+    if _verify_pool_instance is None:
+        # spawn: forking a process that already runs an event loop and threads
+        # is unsafe, and the workers need nothing from the parent's memory.
+        _verify_pool_instance = concurrent.futures.ProcessPoolExecutor(
+            max_workers=_VERIFY_WORKERS,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+    return _verify_pool_instance
+
+
+async def _verify_math_answer_async(ground_truth: str, candidate: str) -> Optional[bool]:
+    """Grade off the event loop. Returns None if the grader itself failed, so the
+    caller can report the submission as ungraded rather than incorrect."""
+    global _verify_pool_instance
+    loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_verify_math_answer, ground_truth, candidate),
+            loop.run_in_executor(_verify_pool(), _verify_math_answer, ground_truth, candidate),
             timeout=_VERIFY_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
-        # Runaway sympy: the worker thread may keep running (threads can't be
-        # cancelled), but the loop and this session are freed. Treat as incorrect.
+        # Runaway sympy that outlived math-verify's own timeouts: treat as
+        # incorrect. The worker stays busy until its alarm fires.
+        logger.warning("math-verify timed out after %.0fs; scoring as incorrect", _VERIFY_TIMEOUT_S)
         return False
+    except BrokenProcessPool:
+        # A worker died (e.g. killed for memory). Replace the pool so later
+        # submissions are graded.
+        logger.exception("math-verify worker pool broke; replacing it")
+        _verify_pool_instance = None
+        return None
     except Exception:
-        return False
+        logger.exception("math-verify raised")
+        return None
 
 
 # Reward for a submission made after the task has already been graded. Negative
@@ -268,8 +304,11 @@ class PrincipiaCollection(Environment):
                 finished=True,
             )
 
+        grader_error = False
         if self.is_numerical:
-            is_correct = await _verify_math_answer_async(self.ground_truth, params.answer)
+            verdict = await _verify_math_answer_async(self.ground_truth, params.answer)
+            grader_error = verdict is None
+            is_correct = bool(verdict)
         else:
             is_correct = await judge_equivalence(
                 problem=self.problem,
@@ -282,9 +321,13 @@ class PrincipiaCollection(Environment):
 
         self.submitted += 1
 
+        metadata = {"correct": is_correct, "answer_type": self.answer_type}
+        if grader_error:
+            # Keep a grader fault distinguishable from a wrong answer.
+            metadata["grader_error"] = True
         return ToolOutput(
             blocks=[TextBlock(type="text", text=f"Reward: {reward}")],
-            metadata={"correct": is_correct, "answer_type": self.answer_type},
+            metadata=metadata,
             reward=reward,
             finished=True,
         )
