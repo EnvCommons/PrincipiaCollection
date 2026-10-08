@@ -53,6 +53,48 @@ def test_verify_latex_fraction():
     assert _verify_math_answer("\\frac{4}{15}", "4/15")
 
 
+# References are rounded decimals: an answer that rounds to the reference at the
+# reference's significant figures is correct; integers, fractions and references
+# with a single significant figure stay exact.
+@pytest.mark.parametrize("reference,answer,ok", [
+    ("0.0011", "\\boxed{0.00112}", True),
+    ("0.0011", "\\[\n\\Delta\\theta \\approx 0.001117^\\circ\n\\]", True),
+    ("0.0011", "\\boxed{0.00116}", False),
+    ("0.0011", "\\boxed{0.0012}", False),
+    ("0.0011", "\\boxed{0.001}", False),
+    ("0.93", "**Answer:** 0.92968", True),
+    ("0.93", "**Answer:** 0.9249", False),
+    ("57.0 mK", "57.03 mK", True),
+    ("57.0 mK", "57.1 mK", False),
+    ("9.1e-6", "\\[\n\\boxed{9.108\\times10^{-6}}\n\\]", True),
+    ("9.1e-6", "As a decimal number: **9.108e-6**", True),
+    ("9.1e-6", "\\boxed{9.2\\times10^{-6}}", False),
+    ("9.1e-6", "**9.108e-5**", False),
+    ("0.6", "\\boxed{0.62}", False),
+    ("2", "\\boxed{2.4}", False),
+    ("15/23", "\\boxed{0.652}", False),
+])
+def test_verify_rounded_decimal_reference(reference: str, answer: str, ok: bool):
+    assert _verify_math_answer(reference, answer) is ok
+
+
+# Formatting around a correct final answer must not hide it from the grader.
+@pytest.mark.parametrize("reference,answer,ok", [
+    ("\\displaystyle \\frac{10}{3}\\ \\text{m}",
+     "\\[\n\\boxed{\\;\\overline{PQ}=\\dfrac{10}{3}\\text{ metres}\\;}\n\\]", True),
+    ("\\frac{5}{4}\\,\\text{ns}", "The lifetime is:\n\n\\[\n\\frac{5}{4}\\,\\text{ns}\n\\]", True),
+    ("2/11", "Their ratio is\n\n\\[\n\\frac{2}{11}.\n\\]", True),
+    ("15/23", "The volume fraction is:\n\n**15/23**", True),
+    ("15/23", "The volume fraction is:\n\n**15/2**", False),
+    ("1/7 points", "**Answer: `1/7 points`**", True),
+    ("1/7 points", "**Answer: `1/8 points`**", False),
+    ("\\frac{24\\,910\\,430\\,999}{312\\,500\\,000}", "\\boxed{\\frac{24\\,910\\,430\\,999}{312\\,500\\,000}}", True),
+    ("\\frac{24\\,910\\,430\\,999}{312\\,500\\,000}", "\\boxed{0}", False),
+])
+def test_verify_formatted_reply(reference: str, answer: str, ok: bool):
+    assert _verify_math_answer(reference, answer) is ok
+
+
 # --- Numerical split: gold and xfail ---
 
 @pytest.mark.asyncio
@@ -101,6 +143,7 @@ def _reply(boxed: str) -> str:
     ("\\boxed{1.273}", 1.0),
     ("1.273", 1.0),
     (_reply("1.274"), 0.0),
+    (_reply("1.2732"), 1.0),
     ("\\boxed{-1.273}", 0.0),
 ])
 async def test_numerical_submit_grades_prose_reply(reply: str, expected: float):
