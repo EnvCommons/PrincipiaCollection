@@ -13,13 +13,16 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+import math
 import multiprocessing
 import os
+import re
 from concurrent.futures.process import BrokenProcessPool
 from typing import Optional
 
 import openai
 import pyarrow.parquet as pq
+import sympy
 from math_verify import parse, verify
 from pydantic import BaseModel
 
@@ -109,14 +112,82 @@ def _parse_answer(answer: str) -> list:
     return parsed
 
 
+# LaTeX spacing commands (\, \; \: \!). math-verify strips a trailing unit
+# such as \text{ns} only when it ends the expression, so spacing around it (or
+# around a boxed answer) makes the unit parse as a symbol.
+_LATEX_SPACING = re.compile(r"\\[,;:!]")
+_DISPLAY_MATH = re.compile(r"(\$\$|\\\[)(.*?)(\$\$|\\\])", re.DOTALL)
+# Markdown bold (**15/23**), but not a power such as 2**10.
+_MARKDOWN_BOLD = re.compile(r"(?<![\w)])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w(])", re.DOTALL)
+# A reference that is one decimal number (decimal point required, optional
+# exponent), optionally followed by a unit without digits: "0.0011", "57.0 mK",
+# "9.1e-6". Integers, fractions and compound expressions don't match.
+_DECIMAL_REFERENCE = re.compile(r"\s*(-?(\d*)\.(\d+)(?:[eE][-+]?\d+)?)(?:\s+[^\d\s]\D*)?", re.DOTALL)
+_E_NOTATION = re.compile(r"(\d)[eE]([-+]?\d+)\b")
+# A reference rounded to fewer significant figures than this is compared
+# exactly: its rounding interval (over 5% of the value) is too wide to credit.
+_MIN_ROUNDED_SIG_FIGS = 2
+
+
+def _normalize_reply(text: str) -> str:
+    """Remove formatting that hides the answer from math-verify: LaTeX spacing,
+    markdown bold and code marks, and whitespace or sentence punctuation at the
+    end of a display-math block."""
+    text = _MARKDOWN_BOLD.sub(r"\1", _LATEX_SPACING.sub("", text)).replace("`", "")
+    return _DISPLAY_MATH.sub(
+        lambda m: m.group(1) + m.group(2).strip().rstrip(".,;").rstrip() + m.group(3), text
+    )
+
+
+def _numeric_values(parsed: list) -> list[float]:
+    """Real numbers among math-verify parses (the right side of `x = value`)."""
+    values = []
+    for expr in parsed:
+        if isinstance(expr, sympy.Eq):
+            expr = expr.rhs
+        if isinstance(expr, sympy.Expr) and expr.is_number and expr.is_real:
+            values.append(float(expr.evalf()))
+    return values
+
+
+def _matches_rounded_reference(ground_truth: str, reply: str, parsed: list) -> bool:
+    """Whether the reply's answer rounds to a decimal reference.
+
+    A decimal reference is a rounded value: "0.0011" stands for any value in
+    [0.00105, 0.00115], so a more precise answer such as 0.00112 is correct.
+    The reference's significant figures set the tolerance (half a unit in its
+    last digit), so it is relative, unlike math-verify's fixed 6 decimal places.
+    Applies only to references matching _DECIMAL_REFERENCE with at least
+    _MIN_ROUNDED_SIG_FIGS significant figures.
+    """
+    match = _DECIMAL_REFERENCE.fullmatch(ground_truth)
+    if match is None:
+        return False
+    sig_figs = len((match.group(2) + match.group(3)).lstrip("0"))
+    reference = float(match.group(1))
+    if sig_figs < _MIN_ROUNDED_SIG_FIGS or reference == 0:
+        return False
+    # Half a unit in the reference's last significant digit, with slack for float error.
+    half_unit = 0.5 * 10.0 ** (math.floor(math.log10(abs(reference))) - sig_figs + 1) * (1 + 1e-9)
+    values = _numeric_values(parsed)
+    if _E_NOTATION.search(reply):
+        # math-verify reads "9.1e-6" as 9.1; rewrite it as 9.1*10^(-6).
+        values += _numeric_values(_parse_answer(_E_NOTATION.sub(r"\1*10^(\2)", reply)))
+    return any(abs(value - reference) <= half_unit for value in values)
+
+
 def _verify_math_answer(ground_truth: str, candidate: str) -> bool:
-    """Check if candidate is mathematically equivalent to ground truth using math-verify.
+    """Check if candidate is mathematically equivalent to ground truth using
+    math-verify, or rounds to a decimal ground truth.
 
     math-verify bounds each parse and comparison with signal.alarm, which only
     works in a process's main thread: in any other thread it raises instead of
     grading. Call this on a main thread (e.g. in a _verify_pool() worker).
     """
-    return verify(_parse_answer(ground_truth), _parse_answer(candidate))
+    reply = _normalize_reply(candidate)
+    parsed = _parse_answer(reply)
+    gold = _parse_answer(_normalize_reply(ground_truth))
+    return verify(gold, parsed) or _matches_rounded_reference(ground_truth, reply, parsed)
 
 
 # math-verify runs sympy, which is CPU-bound and can run for minutes on

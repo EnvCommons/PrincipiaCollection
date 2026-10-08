@@ -28,7 +28,7 @@
 
 Binary reward (0.0 or 1.0).
 - `train` split: single LLM equivalence judge call
-- `train_numerical` split: exact numeric match with small tolerance
+- `train_numerical` split: math-verify equivalence. A decimal reference with at least 2 significant figures (e.g. `0.0011`, `57.0 mK`, `9.1e-6`) also accepts any answer that rounds to it at those significant figures (`0.00112`); integer and fraction references stay exact
 
 ## Data
 
