@@ -20,7 +20,7 @@
 ## Tasks
 
 - **train**: 248,743 mathematical object problems (LLM-judged)
-- **train_numerical**: 305,656 numerical problems (exact match)
+- **train_numerical**: 302,962 numerical problems (exact match). The source has 305,656; the 2,694 whose reference states that no valid value exists (e.g. "No feasible integer N satisfies all three constraints.") are left out, since numerical grading can't credit a correct reply to them. `excluded_rows.json` lists them by source row; `build_excluded_rows.py` regenerates it.
 - Each task has: `id`, `problem_statement`, `topic`, `answer_type`, `split`
 - Answer types include: Set, Interval, Equation, Inequality, Matrix, Integer, Decimal, Fraction
 

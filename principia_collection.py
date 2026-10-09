@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import functools
+import json
 import logging
 import math
 import multiprocessing
@@ -21,6 +22,7 @@ from concurrent.futures.process import BrokenProcessPool
 from typing import Optional
 
 import openai
+import pyarrow as pa
 import pyarrow.parquet as pq
 import sympy
 from math_verify import parse, verify
@@ -42,6 +44,23 @@ _SPLIT_FILES = {
 }
 _SPLIT_ID_PREFIX = {"train": "mo", "train_numerical": "num"}
 _PREFIX_SPLIT = {prefix: split for split, prefix in _SPLIT_ID_PREFIX.items()}
+# Parquet rows left out of each split, listed by source row. The numerical
+# split leaves out references that state no valid value exists ("No feasible
+# integer N satisfies all three constraints."): the numerical grader can't
+# credit a correct reply to them. build_excluded_rows.py regenerates the list.
+_EXCLUDED_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excluded_rows.json")
+
+
+@functools.lru_cache(maxsize=None)
+def _kept_rows(split: str) -> pa.Array:
+    """Source parquet row of each task index in a split, skipping excluded rows."""
+    path = _SPLIT_FILES.get(split)
+    if path is None:
+        raise KeyError(f"Unknown split: {split!r}")
+    with open(_EXCLUDED_ROWS_FILE) as f:
+        excluded = set(json.load(f).get(split, []))
+    num_rows = pq.ParquetFile(path).metadata.num_rows
+    return pa.array([row for row in range(num_rows) if row not in excluded], type=pa.int64())
 
 
 @functools.lru_cache(maxsize=None)
@@ -79,7 +98,9 @@ def _index_for_id(task_id: str) -> int:
 
 def _ground_truth_for(task_id: str) -> str:
     """Resolve a task's ground-truth answer without materializing the dataset."""
-    return _answer_column(_split_for_id(task_id))[_index_for_id(task_id)].as_py()
+    split = _split_for_id(task_id)
+    row = _kept_rows(split)[_index_for_id(task_id)].as_py()
+    return _answer_column(split)[row].as_py()
 
 
 def _public_task_spec(split: str, index: int, row: dict) -> JSONObject:
@@ -96,7 +117,7 @@ def __getattr__(name: str):
     if name == "ALL_ANSWERS":
         all_answers: dict[str, str] = {}
         for split, prefix in _SPLIT_ID_PREFIX.items():
-            for i, ans in enumerate(_answer_column(split).to_pylist()):
+            for i, ans in enumerate(_answer_column(split).take(_kept_rows(split)).to_pylist()):
                 all_answers[f"{prefix}_{i}"] = ans
         globals()["ALL_ANSWERS"] = all_answers
         return all_answers
@@ -297,12 +318,11 @@ class PrincipiaCollection(Environment):
 
     @classmethod
     async def num_tasks(cls, split: str) -> int:
-        """Row count straight from parquet metadata — no data is materialized."""
-        path = _SPLIT_FILES.get(split)
-        if path is None:
+        """Task count from parquet metadata and the exclusion list — no data is materialized."""
+        if split not in _SPLIT_FILES:
             return 0
         # Reading the parquet footer is blocking I/O; keep it off the event loop.
-        return await asyncio.to_thread(lambda: pq.ParquetFile(path).metadata.num_rows)
+        return await asyncio.to_thread(lambda: len(_kept_rows(split)))
 
     @classmethod
     async def get_task(cls, split: str, index: int) -> JSONObject:
@@ -312,7 +332,7 @@ class PrincipiaCollection(Environment):
         # offload it to a worker thread to avoid stalling the loop for other
         # sessions on the pod.
         row = await asyncio.to_thread(
-            lambda: _split_table(split).slice(index, 1).to_pylist()[0]
+            lambda: _split_table(split).slice(_kept_rows(split)[index].as_py(), 1).to_pylist()[0]
         )
         return _public_task_spec(split, index, row)
 
@@ -326,8 +346,8 @@ class PrincipiaCollection(Environment):
 
         def _materialize() -> list[JSONObject]:
             # Full-table materialization + slice->pylist is blocking; run off-loop.
-            table = _split_table(split)
-            total = table.num_rows
+            kept = _kept_rows(split)
+            total = len(kept)
             lo = 0 if start is None else start
             hi = total if stop is None else stop
             if lo < 0:
@@ -336,7 +356,7 @@ class PrincipiaCollection(Environment):
                 hi = max(total + hi, 0)
             lo = min(lo, total)
             hi = min(hi, total)
-            rows = table.slice(lo, max(hi - lo, 0)).to_pylist()
+            rows = _split_table(split).take(kept.slice(lo, max(hi - lo, 0))).to_pylist()
             return [_public_task_spec(split, lo + i, row) for i, row in enumerate(rows)]
 
         return await asyncio.to_thread(_materialize)
@@ -347,7 +367,7 @@ class PrincipiaCollection(Environment):
         on the session-creation hot path and never run at import."""
         if split not in _SPLIT_FILES:
             return []
-        rows = _split_table(split).to_pylist()
+        rows = _split_table(split).take(_kept_rows(split)).to_pylist()
         return [_public_task_spec(split, i, row) for i, row in enumerate(rows)]
 
     def get_prompt(self) -> list[TextBlock]:
