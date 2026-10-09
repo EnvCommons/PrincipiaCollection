@@ -208,6 +208,92 @@ async def test_grader_fault_is_flagged_not_silently_incorrect(monkeypatch):
     assert "1.273" not in str(result.metadata) + result.blocks[0].text
 
 
+# --- Excluded rows ---
+
+def _clear_split_caches():
+    for fn in (principia_collection._kept_rows, principia_collection._split_table,
+               principia_collection._answer_column):
+        fn.cache_clear()
+    principia_collection.__dict__.pop("ALL_ANSWERS", None)
+
+
+@pytest.fixture
+def five_row_numerical_split(tmp_path, monkeypatch):
+    """A 5-row numerical split whose rows 1 and 4 are excluded."""
+    import json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    answers = ["10", "No such N exists", "30", "40", "none"]
+    path = tmp_path / "numerical.parquet"
+    pq.write_table(pa.table({
+        "topic": ["t"] * 5,
+        "problem_statement": [f"problem {row}" for row in range(5)],
+        "answer": answers,
+        "answer_type": ["Integer w/o unit"] * 5,
+    }), path)
+    excluded = tmp_path / "excluded_rows.json"
+    excluded.write_text(json.dumps({"train_numerical": [1, 4]}))
+    monkeypatch.setattr(principia_collection, "_EXCLUDED_ROWS_FILE", str(excluded))
+    monkeypatch.setitem(principia_collection._SPLIT_FILES, "train_numerical", str(path))
+    _clear_split_caches()
+    yield
+    _clear_split_caches()
+
+
+@pytest.mark.asyncio
+async def test_excluded_rows_are_not_served(five_row_numerical_split):
+    split = "train_numerical"
+    assert await PrincipiaCollection.num_tasks(split) == 3
+
+    served = ["problem 0", "problem 2", "problem 3"]
+    listed = PrincipiaCollection.list_tasks(split)
+    assert [t["problem_statement"] for t in listed] == served
+    assert [t["id"] for t in listed] == ["num_0", "num_1", "num_2"]
+    ranged = await PrincipiaCollection.get_task_range(split)
+    assert [t["problem_statement"] for t in ranged] == served
+    ranged = await PrincipiaCollection.get_task_range(split, 1, 3)
+    assert [t["problem_statement"] for t in ranged] == served[1:]
+
+    task = await PrincipiaCollection.get_task(split, 1)
+    assert (task["id"], task["problem_statement"]) == ("num_1", "problem 2")
+    assert "answer" not in task
+    # The ground truth follows the served row, not the source row with the same index.
+    env = PrincipiaCollection(task_spec=task)
+    assert env.ground_truth == "30"
+    assert (await env.submit(SubmitParams(answer="\\boxed{30}"))).reward == 1.0
+    assert principia_collection.ALL_ANSWERS["num_2"] == "40"
+
+
+def test_shipped_exclusions():
+    import json
+    from build_excluded_rows import states_no_value
+
+    with open(principia_collection._EXCLUDED_ROWS_FILE) as f:
+        rows = json.load(f)
+    assert set(rows) == {"train_numerical"}
+    assert 62174 in rows["train_numerical"]
+    assert rows["train_numerical"] == sorted(set(rows["train_numerical"]))
+
+    for reference in [
+        "No feasible integer N satisfies all three constraints.",
+        "none",
+        "\\text{No such a exists}",
+        "Target cannot be achieved within the given time and speed limits.",
+        "The population never reaches 4.0×10⁸ cells; it will decline to extinction.",
+    ]:
+        assert states_no_value(reference), reference
+    for reference in [
+        "42", "\\frac{22}{15} \\text{ central charge units}", "70 vehicles per hour",
+        "0.625 bits per symbol", "\\infty", "n+1 directions", "12\u202f%",
+    ]:
+        assert not states_no_value(reference), reference
+
+    # Why these rows can't be graded numerically: a quoted parameter is credited.
+    reference = "No real critical pressure; the ratio never reaches 1.5, so the material remains insulating."
+    assert _verify_math_answer(reference, "\\boxed{1.5}")
+
+
 # --- Mathematical object split: gold and xfail (requires LLM) ---
 
 @pytest.mark.asyncio
