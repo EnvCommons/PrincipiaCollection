@@ -208,8 +208,6 @@ async def test_grader_fault_is_flagged_not_silently_incorrect(monkeypatch):
     assert "1.273" not in str(result.metadata) + result.blocks[0].text
 
 
-# --- Excluded rows ---
-
 def _clear_split_caches():
     for fn in (principia_collection._kept_rows, principia_collection._split_table,
                principia_collection._answer_column):
